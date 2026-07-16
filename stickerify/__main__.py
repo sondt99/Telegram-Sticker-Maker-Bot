@@ -27,6 +27,7 @@ def main() -> None:
     app = Application.builder().token(config.bot_token).build()
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", h.start))
+    app.add_handler(CommandHandler("rembg", h.rembg))
     app.add_handler(MessageHandler(filters.PHOTO, h.on_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, h.on_document))
     app.add_handler(MessageHandler(filters.ANIMATION, h.on_animation))

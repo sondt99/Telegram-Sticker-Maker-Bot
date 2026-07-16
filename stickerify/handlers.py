@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _VIDEO_EXTENSIONS = (".gif", ".mp4", ".webm", ".mov")
+_ALBUM_WAIT = 2.0
 
 
 class Handlers:
@@ -23,6 +24,8 @@ class Handlers:
 
     def __init__(self, converter: StickerConverter) -> None:
         self._conv = converter
+
+    # ── commands ──────────────────────────────────────────────
 
     async def start(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         ffmpeg = (
@@ -33,34 +36,64 @@ class Handlers:
         await update.message.reply_text(
             "🎨 *Sticker Maker Bot*\n\n"
             "Send me:\n"
-            "• 🖼 Photo\n"
+            "• 🖼 Photo or album (batch)\n"
             "• 📎 Image file (jpg, png, bmp, tiff…)\n"
             "• 🎬 GIF / Short video\n"
             "• 😀 Sticker\n\n"
-            f"I'll send back *PNG + WebP* at 512px, ready for stickers!\n\n{ffmpeg}",
+            "I'll send back *PNG + WebP* at 512px, ready for stickers\\!\n\n"
+            "*Commands:*\n"
+            "/rembg — toggle background removal\n\n"
+            f"{ffmpeg}",
             parse_mode="Markdown",
         )
 
-    async def on_photo(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    async def rembg(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        enabled = not context.user_data.get("rembg", False)
+        context.user_data["rembg"] = enabled
+        status = "ON ✅" if enabled else "OFF"
+        await update.message.reply_text(
+            f"🔄 Background removal: *{status}*\n\n"
+            f"{'Send a photo to try it!' if enabled else 'Sending photos will keep the original background.'}",
+            parse_mode="Markdown",
+        )
+
+    # ── media handlers ───────────────────────────────────────
+
+    async def on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
-        photo = msg.photo[-1]
-        data = await (await photo.get_file()).download_as_bytearray()
+        remove_bg = context.user_data.get("rembg", False)
 
+        if msg.media_group_id:
+            await self._collect_album(msg, context, remove_bg)
+            return
+
+        data = await (await msg.photo[-1].get_file()).download_as_bytearray()
         img = Image.open(io.BytesIO(data))
-        png, webp = self._conv.convert(img)
-        await self._send_pair(msg, png, webp, f"PNG — {img.width}x{img.height} → 512px")
 
-    async def on_document(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        if remove_bg:
+            await msg.reply_text("⏳ Removing background…")
+
+        png, webp = self._conv.convert(img, remove_bg=remove_bg)
+        suffix = " (bg removed)" if remove_bg else ""
+        await self._send_pair(msg, png, webp, f"PNG — {img.width}x{img.height} → 512px{suffix}")
+
+    async def on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         doc = msg.document
         mime = doc.mime_type or ""
         fname = (doc.file_name or "").lower()
+        remove_bg = context.user_data.get("rembg", False)
 
         if mime.startswith("image/") and "gif" not in mime:
             data = await (await doc.get_file()).download_as_bytearray()
             img = Image.open(io.BytesIO(data))
-            png, webp = self._conv.convert(img)
-            await self._send_pair(msg, png, webp, "PNG 512px")
+
+            if remove_bg:
+                await msg.reply_text("⏳ Removing background…")
+
+            png, webp = self._conv.convert(img, remove_bg=remove_bg)
+            suffix = " (bg removed)" if remove_bg else ""
+            await self._send_pair(msg, png, webp, f"PNG 512px{suffix}")
             return
 
         is_video = (
@@ -86,10 +119,11 @@ class Handlers:
             return
         await self._process_video(update.message, update.message.video)
 
-    async def on_sticker(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    async def on_sticker(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         sticker = msg.sticker
         data = bytes(await (await sticker.get_file()).download_as_bytearray())
+        remove_bg = context.user_data.get("rembg", False)
 
         if sticker.is_animated or sticker.is_video:
             if not self._conv.has_ffmpeg:
@@ -99,18 +133,66 @@ class Handlers:
             if not img:
                 await msg.reply_text("❌ Failed to extract frame from animated sticker.")
                 return
-            png, webp = self._conv.convert(img)
+            png, webp = self._conv.convert(img, remove_bg=remove_bg)
             await self._send_pair(msg, png, webp, "PNG (frame from animated sticker)")
             return
 
         img = Image.open(io.BytesIO(data))
-        png, webp = self._conv.convert(img)
-        await self._send_pair(msg, png, webp, "PNG 512px")
+        png, webp = self._conv.convert(img, remove_bg=remove_bg)
+        suffix = " (bg removed)" if remove_bg else ""
+        await self._send_pair(msg, png, webp, f"PNG 512px{suffix}")
 
     async def on_unknown(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "💡 Send a photo, GIF, video, or sticker to convert!\nType /start for instructions."
         )
+
+    # ── album (batch) ────────────────────────────────────────
+
+    async def _collect_album(
+        self, msg: Message, context: ContextTypes.DEFAULT_TYPE, remove_bg: bool
+    ) -> None:
+        group_id = msg.media_group_id
+        key = f"album_{msg.chat_id}_{group_id}"
+
+        data = bytes(await (await msg.photo[-1].get_file()).download_as_bytearray())
+
+        albums = context.bot_data.setdefault("albums", {})
+        if key not in albums:
+            albums[key] = {"photos": [], "chat_id": msg.chat_id, "remove_bg": remove_bg}
+            context.job_queue.run_once(self._process_album, _ALBUM_WAIT, data=key, name=key)
+
+        albums[key]["photos"].append(data)
+
+    async def _process_album(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        key = context.job.data
+        albums = context.bot_data.get("albums", {})
+        album = albums.pop(key, None)
+        if not album:
+            return
+
+        chat_id = album["chat_id"]
+        photos = album["photos"]
+        remove_bg = album["remove_bg"]
+        count = len(photos)
+
+        tag = " + bg removal" if remove_bg else ""
+        await context.bot.send_message(chat_id, f"⏳ Processing {count} photos{tag}…")
+
+        for i, photo_data in enumerate(photos, 1):
+            img = Image.open(io.BytesIO(photo_data))
+            png, webp = self._conv.convert(img, remove_bg=remove_bg)
+            label = f"[{i}/{count}]"
+            await context.bot.send_document(
+                chat_id, InputFile(png, f"sticker_{i}.png"), caption=f"📐 {label} PNG 512px"
+            )
+            await context.bot.send_document(
+                chat_id, InputFile(webp, f"sticker_{i}.webp"), caption=f"📐 {label} WebP"
+            )
+
+        await context.bot.send_message(chat_id, f"✅ Done! {count} photos converted.")
+
+    # ── helpers ───────────────────────────────────────────────
 
     async def _process_video(self, msg: Message, media: object) -> None:
         if not self._conv.has_ffmpeg:

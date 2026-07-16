@@ -29,7 +29,9 @@ class StickerConverter:
     def has_ffmpeg(self) -> bool:
         return self._has_ffmpeg
 
-    def convert(self, img: Image.Image) -> tuple[io.BytesIO, io.BytesIO]:
+    def convert(self, img: Image.Image, *, remove_bg: bool = False) -> tuple[io.BytesIO, io.BytesIO]:
+        if remove_bg:
+            img = self._remove_background(img)
         img = self._resize(img.convert("RGBA"))
         return self._to_buffer(img, "PNG"), self._to_buffer(img, "WEBP", quality=self._quality)
 
@@ -42,6 +44,11 @@ class StickerConverter:
         if not self._has_ffmpeg:
             return None
         return self._ffmpeg_animate(data)
+
+    @staticmethod
+    def _remove_background(img: Image.Image) -> Image.Image:
+        from rembg import remove
+        return remove(img)
 
     def _resize(self, img: Image.Image) -> Image.Image:
         w, h = img.size
