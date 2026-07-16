@@ -71,8 +71,13 @@ class StickerConverter:
         w, h = img.size
         if w == 0 or h == 0:
             return img
-        ratio = self._size / max(w, h)
-        return img.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.LANCZOS)
+        if w >= h:
+            new_w = self._size
+            new_h = max(1, round(h * self._size / w))
+        else:
+            new_h = self._size
+            new_w = max(1, round(w * self._size / h))
+        return img.resize((new_w, new_h), Image.LANCZOS)
 
     @staticmethod
     def _to_buffer(img: Image.Image, fmt: str, **kwargs: int) -> io.BytesIO:
