@@ -31,7 +31,7 @@ class StickerConverter:
 
     def convert(self, img: Image.Image, *, remove_bg: bool = False) -> tuple[io.BytesIO, io.BytesIO]:
         if remove_bg:
-            img = self._remove_background(img)
+            img = self.remove_background(img)
         img = self._resize(img.convert("RGBA"))
         return self._to_buffer(img, "PNG"), self._to_buffer(img, "WEBP", quality=self._quality)
 
@@ -46,9 +46,26 @@ class StickerConverter:
         return self._ffmpeg_animate(data)
 
     @staticmethod
-    def _remove_background(img: Image.Image) -> Image.Image:
+    def remove_background(img: Image.Image) -> Image.Image:
         from rembg import remove
         return remove(img)
+
+    def to_png(self, img: Image.Image) -> io.BytesIO:
+        return self._to_buffer(img.convert("RGBA"), "PNG")
+
+    def extract_frame_original(self, data: bytes) -> Image.Image | None:
+        if not self._has_ffmpeg:
+            return None
+        src = self._write_temp(data, ".webm")
+        dst = src + ".png"
+        try:
+            self._run_ffmpeg(["-i", src, "-frames:v", "1", dst], timeout=30)
+            return Image.open(dst).copy() if os.path.exists(dst) else None
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Original frame extraction failed: %s", exc)
+            return None
+        finally:
+            self._cleanup(src, dst)
 
     def _resize(self, img: Image.Image) -> Image.Image:
         w, h = img.size

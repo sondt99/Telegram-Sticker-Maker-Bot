@@ -39,12 +39,11 @@ class Handlers:
             "• 🖼 Photo or album (batch)\n"
             "• 📎 Image file (jpg, png, bmp, tiff…)\n"
             "• 🎬 GIF / Short video\n"
-            "• 😀 Sticker\n\n"
-            "I'll send back *PNG + WebP* at 512px, ready for stickers\\!\n\n"
+            "• 😀 Sticker → original HD image \\+ sticker\\-ready files\n\n"
             "*Commands:*\n"
             "/rembg — toggle background removal\n\n"
             f"{ffmpeg}",
-            parse_mode="Markdown",
+            parse_mode="MarkdownV2",
         )
 
     async def rembg(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -62,6 +61,7 @@ class Handlers:
     async def on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         remove_bg = context.user_data.get("rembg", False)
+        await self._ack(msg)
 
         if msg.media_group_id:
             await self._collect_album(msg, context, remove_bg)
@@ -83,6 +83,7 @@ class Handlers:
         mime = doc.mime_type or ""
         fname = (doc.file_name or "").lower()
         remove_bg = context.user_data.get("rembg", False)
+        await self._ack(msg)
 
         if mime.startswith("image/") and "gif" not in mime:
             data = await (await doc.get_file()).download_as_bytearray()
@@ -108,37 +109,50 @@ class Handlers:
         await msg.reply_text("🤔 Unrecognized file type.\nSend an image, GIF, or short video!")
 
     async def on_animation(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        await self._ack(msg)
         if not self._conv.has_ffmpeg:
-            await update.message.reply_text("⚠️ FFmpeg is not installed — cannot process GIFs.")
+            await msg.reply_text("⚠️ FFmpeg is not installed — cannot process GIFs.")
             return
-        await self._process_video(update.message, update.message.animation)
+        await self._process_video(msg, msg.animation)
 
     async def on_video(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.message
+        await self._ack(msg)
         if not self._conv.has_ffmpeg:
-            await update.message.reply_text("⚠️ FFmpeg is not installed — cannot process videos.")
+            await msg.reply_text("⚠️ FFmpeg is not installed — cannot process videos.")
             return
-        await self._process_video(update.message, update.message.video)
+        await self._process_video(msg, msg.video)
 
     async def on_sticker(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         sticker = msg.sticker
         data = bytes(await (await sticker.get_file()).download_as_bytearray())
         remove_bg = context.user_data.get("rembg", False)
+        await self._ack(msg)
 
         if sticker.is_animated or sticker.is_video:
             if not self._conv.has_ffmpeg:
-                await msg.reply_text("⚠️ Animated stickers require FFmpeg.")
+                await msg.reply_text("⚠️ Animated/video stickers require FFmpeg.")
                 return
-            img = self._conv.extract_frame(data)
+            img = self._conv.extract_frame_original(data)
             if not img:
-                await msg.reply_text("❌ Failed to extract frame from animated sticker.")
+                await msg.reply_text("❌ Failed to extract frame from this sticker.")
                 return
-            png, webp = self._conv.convert(img, remove_bg=remove_bg)
-            await self._send_pair(msg, png, webp, "PNG (frame from animated sticker)")
-            return
+        else:
+            img = Image.open(io.BytesIO(data))
 
-        img = Image.open(io.BytesIO(data))
-        png, webp = self._conv.convert(img, remove_bg=remove_bg)
+        if remove_bg:
+            await msg.reply_text("⏳ Removing background…")
+            img = self._conv.remove_background(img)
+
+        original = self._conv.to_png(img)
+        await msg.reply_document(
+            InputFile(original, "original.png"),
+            caption=f"🖼 Original quality — {img.width}x{img.height}px",
+        )
+
+        png, webp = self._conv.convert(img)
         suffix = " (bg removed)" if remove_bg else ""
         await self._send_pair(msg, png, webp, f"PNG 512px{suffix}")
 
@@ -220,6 +234,13 @@ class Handlers:
     async def _send_pair(msg: Message, png: io.BytesIO, webp: io.BytesIO, caption: str) -> None:
         await msg.reply_document(InputFile(png, "sticker.png"), caption=f"📐 {caption}")
         await msg.reply_document(InputFile(webp, "sticker.webp"), caption="📐 WebP — ready for sticker!")
+
+    @staticmethod
+    async def _ack(msg: Message) -> None:
+        try:
+            await msg.set_reaction("👀")
+        except Exception:
+            pass
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
