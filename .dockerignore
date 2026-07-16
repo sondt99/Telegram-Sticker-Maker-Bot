@@ -1,0 +1,10 @@
+.env
+.git
+.gitignore
+.vscode
+.idea
+__pycache__
+*.pyc
+*.md
+LICENSE
+sticker_bot.py
