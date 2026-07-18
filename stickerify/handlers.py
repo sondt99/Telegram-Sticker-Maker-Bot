@@ -29,21 +29,21 @@ class Handlers:
 
     async def start(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         ffmpeg = (
-            "✅ FFmpeg available — video/GIF supported"
+            "✅ FFmpeg available — GIF/video → WEBM VP9 supported"
             if self._conv.has_ffmpeg
             else "⚠️ FFmpeg not installed — static images only"
         )
         await update.message.reply_text(
-            "🎨 *Sticker Maker Bot*\n\n"
+            "🎨 Sticker Maker Bot\n\n"
             "Send me:\n"
-            "• 🖼 Photo or album (batch)\n"
+            "• 🖼 Photo or album → static PNG + WebP\n"
             "• 📎 Image file (jpg, png, bmp, tiff…)\n"
-            "• 🎬 GIF / Short video\n"
-            "• 😀 Sticker → original HD image \\+ sticker\\-ready files\n\n"
-            "*Commands:*\n"
+            "• 🎬 GIF / Short video → static frame + WEBM VP9 video sticker\n"
+            "• 😀 Sticker → original HD image + sticker-ready files\n\n"
+            "Telegram packs are type-locked: static PNG/WebP and video WEBM need separate packs.\n\n"
+            "Commands:\n"
             "/rembg — toggle background removal\n\n"
-            f"{ffmpeg}",
-            parse_mode="MarkdownV2",
+            f"{ffmpeg}"
         )
 
     async def rembg(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -131,14 +131,25 @@ class Handlers:
         remove_bg = context.user_data.get("rembg", False)
         await self._ack(msg)
 
-        if sticker.is_animated or sticker.is_video:
+        if sticker.is_animated and not sticker.is_video:
+            await msg.reply_text(
+                "⚠️ TGS animated stickers are not supported yet. "
+                "Send a static/video sticker, GIF, or short video instead."
+            )
+            return
+
+        if sticker.is_video:
             if not self._conv.has_ffmpeg:
-                await msg.reply_text("⚠️ Animated/video stickers require FFmpeg.")
+                await msg.reply_text("⚠️ Video stickers require FFmpeg.")
                 return
             img = self._conv.extract_frame_original(data)
             if not img:
-                await msg.reply_text("❌ Failed to extract frame from this sticker.")
+                await msg.reply_text("❌ Failed to extract frame from this video sticker.")
                 return
+            await msg.reply_document(
+                InputFile(io.BytesIO(data), "original_video_sticker.webm"),
+                caption="🎬 Original WEBM — video sticker pack file",
+            )
         else:
             img = Image.open(io.BytesIO(data))
 
@@ -216,19 +227,38 @@ class Handlers:
         await msg.reply_text("⏳ Processing…")
         data = bytes(await (await media.get_file()).download_as_bytearray())  # type: ignore[union-attr]
 
-        animated = self._conv.to_animated_webp(data)
         img = self._conv.extract_frame(data)
         if not img:
             await msg.reply_text("❌ Failed to extract frame.")
             return
 
         png, webp = self._conv.convert(img)
-        await msg.reply_document(InputFile(png, "sticker_frame.png"), caption="📐 PNG (first frame)")
+        await msg.reply_document(
+            InputFile(png, "sticker_frame.png"),
+            caption="📐 PNG first frame — for static sticker packs",
+        )
+        await msg.reply_document(
+            InputFile(webp, "sticker_frame.webp"),
+            caption="📐 WebP first frame — for static sticker packs",
+        )
 
-        if animated:
-            await msg.reply_document(InputFile(animated, "sticker_animated.webp"), caption="🎬 Animated WebP — animated sticker!")
-        else:
-            await msg.reply_document(InputFile(webp, "sticker.webp"), caption="📐 Static WebP")
+        video = self._conv.to_video_sticker(data)
+        if video.ok and video.buffer:
+            size = f" ({video.size_bytes // 1024}KB)" if video.size_bytes else ""
+            await msg.reply_document(
+                InputFile(video.buffer, "video_sticker.webm"),
+                caption=f"🎬 WEBM VP9{size} — for Telegram video sticker packs only",
+            )
+            await msg.reply_text("ℹ️ Static PNG/WebP and video WEBM must be added to separate sticker packs.")
+            return
+
+        message = (
+            "⚠️ Could not create a WEBM video sticker within Telegram limits.\n"
+            "Use the static PNG/WebP above, or try a shorter/simpler GIF/video."
+        )
+        if video.reason:
+            message += f"\nReason: {video.reason}"
+        await msg.reply_text(message)
 
     @staticmethod
     async def _send_pair(msg: Message, png: io.BytesIO, webp: io.BytesIO, caption: str) -> None:

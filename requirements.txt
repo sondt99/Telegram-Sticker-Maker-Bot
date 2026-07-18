@@ -2,3 +2,4 @@ python-telegram-bot==21.10
 Pillow==11.2.1
 rembg>=2.0.50
 onnxruntime>=1.17.0
+pytest>=8.0.0
