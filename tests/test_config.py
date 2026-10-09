@@ -9,6 +9,7 @@ _ENV_KEYS = (
     "BOT_TOKEN",
     "STICKER_SIZE",
     "WEBP_QUALITY",
+    "STATIC_MAX_BYTES",
     "VIDEO_MAX_BYTES",
     "VIDEO_DURATION",
     "VIDEO_FPS",
@@ -30,6 +31,14 @@ def test_from_env_requires_bot_token(monkeypatch: pytest.MonkeyPatch) -> None:
         Config.from_env()
 
 
+def test_from_env_rejects_blank_bot_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("BOT_TOKEN", "   ")
+
+    with pytest.raises(SystemExit, match="BOT_TOKEN"):
+        Config.from_env()
+
+
 def test_from_env_uses_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_env(monkeypatch)
     monkeypatch.setenv("BOT_TOKEN", "token")
@@ -40,6 +49,7 @@ def test_from_env_uses_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.bot_token == "token"
     assert config.sticker_size == 512
     assert config.webp_quality == 90
+    assert config.static_max_bytes == 512 * 1024
     assert config.video_max_bytes == 256 * 1024
     assert config.video_duration == 3
     assert config.video_fps == 30
@@ -47,25 +57,29 @@ def test_from_env_uses_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.video_max_crf == 48
     assert config.video_crf_step == 4
     assert config.ffmpeg_available is False
+    assert config.ffprobe_available is False
 
 
 def test_from_env_reads_media_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_env(monkeypatch)
-    monkeypatch.setenv("BOT_TOKEN", "token")
-    monkeypatch.setenv("STICKER_SIZE", "256")
+    monkeypatch.setenv("BOT_TOKEN", " token ")
+    monkeypatch.setenv("STICKER_SIZE", "512")
     monkeypatch.setenv("WEBP_QUALITY", "80")
+    monkeypatch.setenv("STATIC_MAX_BYTES", "200000")
     monkeypatch.setenv("VIDEO_MAX_BYTES", "131072")
     monkeypatch.setenv("VIDEO_DURATION", "2")
     monkeypatch.setenv("VIDEO_FPS", "18")
     monkeypatch.setenv("VIDEO_MIN_CRF", "40")
     monkeypatch.setenv("VIDEO_MAX_CRF", "52")
     monkeypatch.setenv("VIDEO_CRF_STEP", "6")
-    monkeypatch.setattr("stickerify.config.shutil.which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("stickerify.config.shutil.which", lambda name: f"/usr/bin/{name}")
 
     config = Config.from_env()
 
-    assert config.sticker_size == 256
+    assert config.bot_token == "token"
+    assert config.sticker_size == 512
     assert config.webp_quality == 80
+    assert config.static_max_bytes == 200000
     assert config.video_max_bytes == 131072
     assert config.video_duration == 2
     assert config.video_fps == 18
@@ -73,6 +87,7 @@ def test_from_env_reads_media_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.video_max_crf == 52
     assert config.video_crf_step == 6
     assert config.ffmpeg_available is True
+    assert config.ffprobe_available is True
 
 
 def test_from_env_rejects_invalid_integer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,6 +96,33 @@ def test_from_env_rejects_invalid_integer(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("VIDEO_FPS", "fast")
 
     with pytest.raises(SystemExit, match="VIDEO_FPS must be an integer"):
+        Config.from_env()
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("STICKER_SIZE", "511", "STICKER_SIZE must be >= 512"),
+        ("STICKER_SIZE", "513", "STICKER_SIZE must be <= 512"),
+        ("WEBP_QUALITY", "0", "WEBP_QUALITY must be >= 1"),
+        ("WEBP_QUALITY", "101", "WEBP_QUALITY must be <= 100"),
+        ("STATIC_MAX_BYTES", "524289", "STATIC_MAX_BYTES must be <= 524288"),
+        ("VIDEO_MAX_BYTES", "262145", "VIDEO_MAX_BYTES must be <= 262144"),
+        ("VIDEO_DURATION", "4", "VIDEO_DURATION must be <= 3"),
+        ("VIDEO_FPS", "31", "VIDEO_FPS must be <= 30"),
+        ("VIDEO_MIN_CRF", "-1", "VIDEO_MIN_CRF must be >= 0"),
+        ("VIDEO_MAX_CRF", "64", "VIDEO_MAX_CRF must be <= 63"),
+        ("VIDEO_CRF_STEP", "0", "VIDEO_CRF_STEP must be >= 1"),
+    ],
+)
+def test_from_env_rejects_telegram_invalid_bounds(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str, message: str
+) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("BOT_TOKEN", "token")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(SystemExit, match=message):
         Config.from_env()
 
 

@@ -4,11 +4,11 @@ Telegram bot that prepares sticker-ready files from photos, GIFs, videos, and st
 
 ## Features
 
-- **Photo / Image file** → static PNG + WebP at 512px
-- **GIF / Video** → static frame PNG + WebP, plus WEBM VP9 video sticker file when FFmpeg can fit Telegram limits
+- **Photo / Image file** → validated static PNG + WebP at 512px
+- **GIF / Video** → static frame PNG + WebP, plus verified WEBM VP9 video sticker file when FFmpeg/FFprobe can fit Telegram limits
 - **Sticker** → reconvert static/video stickers to PNG + WebP; TGS animated stickers are reported as unsupported
-- **Background removal** → `/rembg` toggle, powered by [rembg](https://github.com/danielgatis/rembg)
-- **Batch convert** → send an album of photos, all converted at once
+- **Background removal** → `/rembg` toggle for photos, image files, static stickers, and photo albums
+- **Batch convert** → send a photo album, all valid photos converted with per-item failure handling
 
 ## Quick Start
 
@@ -24,9 +24,15 @@ docker compose up -d --build
 - Open Telegram, find **@BotFather**
 - Send `/newbot` → name your bot → copy the **Bot Token**
 
-### 2. Install dependencies
+### 2. Install runtime dependencies
 ```bash
 pip install -r requirements.txt
+```
+
+For development and tests:
+
+```bash
+pip install -r requirements-dev.txt
 ```
 
 ### 3. Install FFmpeg — required for video/GIF/WEBM support
@@ -38,7 +44,7 @@ sudo apt install ffmpeg
 brew install ffmpeg
 ```
 
-FFmpeg must include `libvpx-vp9` for Telegram video sticker WEBM output.
+FFmpeg must include `libvpx-vp9`, and `ffprobe` must be available to verify Telegram video sticker output.
 
 ### 4. Run
 ```bash
@@ -57,19 +63,19 @@ python -m stickerify
 
 | You send           | Bot replies with                                      |
 |--------------------|-------------------------------------------------------|
-| 🖼 Photo           | PNG + WebP 512px                                      |
-| 🖼 Album (batch)   | All photos converted at once                          |
+| 🖼 Photo           | PNG + WebP 512px, with size warnings if needed        |
+| 🖼 Photo album     | All valid photos converted; failures summarized       |
 | 📎 Image file      | PNG + WebP 512px                                      |
-| 🎬 GIF             | PNG/WebP static frame + WEBM VP9 video sticker file   |
-| 🎥 Short video     | PNG/WebP static frame + WEBM VP9 video sticker file   |
+| 🎬 GIF             | PNG/WebP static frame + verified WEBM VP9 if valid    |
+| 🎥 Short video     | PNG/WebP static frame + verified WEBM VP9 if valid    |
 | 😀 Static sticker  | Original PNG + PNG/WebP reconversion                  |
 | 🎬 Video sticker   | Original WEBM + static PNG/WebP frame                 |
 | ✨ TGS sticker     | Unsupported message                                   |
 
 ## Telegram Sticker Specs
 
-- **Static sticker:** PNG or WebP, longest side = 512px.
-- **Video sticker:** `.webm`, VP9, no audio, short duration, small file size. Stickerify targets 3 seconds and 256KB by default.
+- **Static sticker:** PNG or WebP, 512px sticker canvas, max 512KB.
+- **Video sticker:** `.webm`, VP9, no audio, max 256KB, max 3 seconds, max 30 FPS, 512px canvas.
 - **Animated sticker:** `.tgs` Lottie animation. Stickerify does not convert TGS yet.
 - **Animated WebP is not a Telegram sticker-pack format.** GIF/video inputs are exported as WEBM VP9 for video sticker packs.
 
@@ -85,11 +91,12 @@ Required:
 BOT_TOKEN=your_bot_token_here
 ```
 
-Optional media settings:
+Optional Telegram-safe media settings:
 
 ```env
 STICKER_SIZE=512
 WEBP_QUALITY=90
+STATIC_MAX_BYTES=524288
 VIDEO_MAX_BYTES=262144
 VIDEO_DURATION=3
 VIDEO_FPS=30
@@ -98,14 +105,36 @@ VIDEO_MAX_CRF=48
 VIDEO_CRF_STEP=4
 ```
 
+`STICKER_SIZE`, `STATIC_MAX_BYTES`, `VIDEO_MAX_BYTES`, `VIDEO_DURATION`, and `VIDEO_FPS` are capped to Telegram sticker limits. Invalid values fail at startup.
+
+## Development
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m compileall stickerify tests
+python -m pytest -q
+```
+
+Docker smoke checks:
+
+```bash
+docker build -t stickerify:test .
+docker run --rm --entrypoint python stickerify:test -c "import shutil; assert shutil.which('ffmpeg'); assert shutil.which('ffprobe')"
+```
+
 ## Project Structure
 
 ```
-stickerify/
-├── config.py      — environment config (frozen dataclass)
-├── converter.py   — image/video/rembg conversion
-├── handlers.py    — Telegram message & album handlers
-└── __main__.py    — entry point & bot wiring
+stickerify/config.py     — environment config and Telegram limits
+stickerify/converter.py  — image/video/rembg conversion and validation
+stickerify/handlers.py   — Telegram message & album handlers
+stickerify/__main__.py   — entry point & bot wiring
+tests/                   — pytest coverage for config, converter, and handlers
+Dockerfile               — container image
+docker-compose.yml       — local deployment
+.env.example             — environment template
+requirements.txt         — runtime dependencies
+requirements-dev.txt     — test and dev dependencies
 ```
 
 ## License
