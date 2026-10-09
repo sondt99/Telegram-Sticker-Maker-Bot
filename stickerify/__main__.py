@@ -23,8 +23,12 @@ def main() -> None:
     h = Handlers(converter)
 
     logger.info("FFmpeg: %s", "available" if converter.has_ffmpeg else "not found")
+    logger.info("FFprobe: %s", "available" if config.ffprobe_available else "not found")
 
     app = Application.builder().token(config.bot_token).build()
+    if app.job_queue is None:
+        logger.warning("JobQueue unavailable — photo album batching will fall back to per-photo processing")
+
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", h.start))
     app.add_handler(CommandHandler("rembg", h.rembg))

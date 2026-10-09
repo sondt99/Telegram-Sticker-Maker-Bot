@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import shutil
@@ -14,6 +15,28 @@ from PIL import Image
 from .config import Config
 
 logger = logging.getLogger(__name__)
+
+_WEBP_QUALITY_FALLBACKS = (80, 70, 60, 50, 40)
+
+
+class MediaToolError(RuntimeError):
+    def __init__(self, public_message: str, stderr: str = "") -> None:
+        super().__init__(public_message)
+        self.public_message = public_message
+        self.stderr = stderr
+
+
+@dataclass(frozen=True, slots=True)
+class StaticStickerResult:
+    png: io.BytesIO | None
+    webp: io.BytesIO | None
+    png_size_bytes: int | None = None
+    webp_size_bytes: int | None = None
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.png is not None or self.webp is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +54,7 @@ class StickerConverter:
     __slots__ = (
         "_size",
         "_quality",
+        "_static_max_bytes",
         "_video_max_bytes",
         "_video_duration",
         "_video_fps",
@@ -38,11 +62,13 @@ class StickerConverter:
         "_video_max_crf",
         "_video_crf_step",
         "_has_ffmpeg",
+        "_has_ffprobe",
     )
 
     def __init__(self, config: Config) -> None:
         self._size = config.sticker_size
         self._quality = config.webp_quality
+        self._static_max_bytes = config.static_max_bytes
         self._video_max_bytes = config.video_max_bytes
         self._video_duration = config.video_duration
         self._video_fps = config.video_fps
@@ -50,25 +76,56 @@ class StickerConverter:
         self._video_max_crf = config.video_max_crf
         self._video_crf_step = config.video_crf_step
         self._has_ffmpeg = config.ffmpeg_available
+        self._has_ffprobe = config.ffprobe_available
 
     @property
     def has_ffmpeg(self) -> bool:
         return self._has_ffmpeg
 
-    def convert(self, img: Image.Image, *, remove_bg: bool = False) -> tuple[io.BytesIO, io.BytesIO]:
+    @property
+    def has_video_tools(self) -> bool:
+        return self._has_ffmpeg and self._has_ffprobe
+
+    def convert_static(self, img: Image.Image, *, remove_bg: bool = False) -> StaticStickerResult:
         if remove_bg:
             img = self.remove_background(img)
         img = self._resize(img.convert("RGBA"))
-        return self._to_buffer(img, "PNG"), self._to_buffer(img, "WEBP", quality=self._quality)
 
-    def extract_frame(self, data: bytes, *, middle: bool = False) -> Image.Image | None:
+        warnings: list[str] = []
+        png = self._to_buffer(img, "PNG", optimize=True, compress_level=9)
+        png_size = self._buffer_size(png)
+        if png_size > self._static_max_bytes:
+            warnings.append("PNG output is larger than Telegram's static sticker limit")
+            png = None
+            png_size = None
+
+        webp = None
+        webp_size = None
+        for quality in self._webp_quality_attempts():
+            candidate = self._to_buffer(img, "WEBP", quality=quality, method=6)
+            candidate_size = self._buffer_size(candidate)
+            if candidate_size <= self._static_max_bytes:
+                webp = candidate
+                webp_size = candidate_size
+                if quality != self._quality:
+                    warnings.append(f"WebP quality lowered to {quality} to fit Telegram's static sticker limit")
+                break
+
+        if webp is None:
+            warnings.append("WebP output is larger than Telegram's static sticker limit")
+
+        return StaticStickerResult(png, webp, png_size, webp_size, tuple(warnings))
+
+    def extract_frame(self, data: bytes) -> Image.Image | None:
         if not self._has_ffmpeg:
             return None
-        return self._ffmpeg_extract(data, middle=middle)
+        return self._ffmpeg_extract(data)
 
     def to_video_sticker(self, data: bytes) -> VideoStickerResult:
         if not self._has_ffmpeg:
             return VideoStickerResult(None, reason="FFmpeg is not installed")
+        if not self._has_ffprobe:
+            return VideoStickerResult(None, reason="FFprobe is required to verify video stickers")
         return self._ffmpeg_video_sticker(data)
 
     @staticmethod
@@ -77,7 +134,7 @@ class StickerConverter:
         return remove(img)
 
     def to_png(self, img: Image.Image) -> io.BytesIO:
-        return self._to_buffer(img.convert("RGBA"), "PNG")
+        return self._to_buffer(img.convert("RGBA"), "PNG", optimize=True, compress_level=9)
 
     def extract_frame_original(self, data: bytes) -> Image.Image | None:
         if not self._has_ffmpeg:
@@ -87,7 +144,7 @@ class StickerConverter:
         try:
             self._run_ffmpeg(["-i", src, "-frames:v", "1", dst], timeout=30)
             return Image.open(dst).copy() if os.path.exists(dst) else None
-        except (subprocess.TimeoutExpired, OSError) as exc:
+        except (subprocess.TimeoutExpired, MediaToolError, OSError) as exc:
             logger.warning("Original frame extraction failed: %s", exc)
             return None
         finally:
@@ -106,11 +163,18 @@ class StickerConverter:
         return img.resize((new_w, new_h), Image.LANCZOS)
 
     @staticmethod
-    def _to_buffer(img: Image.Image, fmt: str, **kwargs: int) -> io.BytesIO:
+    def _to_buffer(img: Image.Image, fmt: str, **kwargs: int | bool) -> io.BytesIO:
         buf = io.BytesIO()
         img.save(buf, format=fmt, **kwargs)
         buf.seek(0)
         return buf
+
+    @staticmethod
+    def _buffer_size(buf: io.BytesIO) -> int:
+        return len(buf.getbuffer())
+
+    def _webp_quality_attempts(self) -> tuple[int, ...]:
+        return tuple(dict.fromkeys((self._quality, *[q for q in _WEBP_QUALITY_FALLBACKS if q < self._quality])))
 
     def _scale_filter(self) -> str:
         s = self._size
@@ -119,20 +183,19 @@ class StickerConverter:
     def _video_filter(self) -> str:
         s = self._size
         return (
+            "format=rgba,"
             f"{self._scale_filter()},"
             f"pad={s}:{s}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,"
             f"fps={self._video_fps},format=yuva420p"
         )
 
-    def _ffmpeg_extract(self, data: bytes, *, middle: bool) -> Image.Image | None:
+    def _ffmpeg_extract(self, data: bytes) -> Image.Image | None:
         src = self._write_temp(data, ".mp4")
         dst = src + ".png"
         try:
-            scale = self._scale_filter()
-            vf = f"select='eq(n\\,floor(t*25/2))',{scale}" if middle else scale
-            self._run_ffmpeg(["-i", src, "-vf", vf, "-frames:v", "1", dst], timeout=30)
+            self._run_ffmpeg(["-i", src, "-vf", self._scale_filter(), "-frames:v", "1", dst], timeout=30)
             return Image.open(dst).copy() if os.path.exists(dst) else None
-        except (subprocess.TimeoutExpired, OSError) as exc:
+        except (subprocess.TimeoutExpired, MediaToolError, OSError) as exc:
             logger.warning("Frame extraction failed: %s", exc)
             return None
         finally:
@@ -162,8 +225,8 @@ class StickerConverter:
                         "-auto-alt-ref", "0",
                         dst,
                     ], timeout=90)
-                except (subprocess.TimeoutExpired, OSError) as exc:
-                    last_reason = str(exc)
+                except (subprocess.TimeoutExpired, MediaToolError, OSError) as exc:
+                    last_reason = "Video conversion failed"
                     logger.warning("Video sticker WEBM conversion failed at CRF %d: %s", crf, exc)
                     continue
 
@@ -195,41 +258,112 @@ class StickerConverter:
             )
             return False, "WEBM output is too large for Telegram video sticker limits"
 
-        if not shutil.which("ffprobe"):
-            return True, ""
+        if not self._has_ffprobe or not shutil.which("ffprobe"):
+            return False, "FFprobe is required to verify video stickers"
 
         try:
             probe = subprocess.run([
                 "ffprobe",
                 "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,width,height",
-                "-of", "csv=p=0",
+                "-print_format", "json",
+                "-show_streams",
+                "-show_format",
                 path,
             ], capture_output=True, text=True, timeout=15, check=False)
         except (subprocess.TimeoutExpired, OSError) as exc:
             logger.info("Video sticker ffprobe failed: %s", exc)
-            return True, ""
+            return False, "WEBM output could not be verified"
 
         if probe.returncode != 0:
             logger.info("Video sticker ffprobe failed: %s", probe.stderr.strip())
-            return True, ""
+            return False, "WEBM output could not be verified"
 
-        fields = probe.stdout.strip().split(",")
-        if len(fields) < 3:
-            return False, "WEBM output could not be probed"
-        codec, width_raw, height_raw = fields[:3]
-        if codec != "vp9":
-            return False, "WEBM output is not VP9"
         try:
-            width = int(width_raw)
-            height = int(height_raw)
-        except ValueError:
-            return False, "WEBM output dimensions could not be probed"
-        if width > self._size or height > self._size:
-            return False, "WEBM output is larger than the Telegram sticker canvas"
+            payload = json.loads(probe.stdout)
+        except json.JSONDecodeError:
+            return False, "WEBM output could not be verified"
+
+        return self._validate_probe_payload(payload)
+
+    def _validate_probe_payload(self, payload: dict[str, object]) -> tuple[bool, str]:
+        streams = payload.get("streams")
+        if not isinstance(streams, list):
+            return False, "WEBM output could not be verified"
+
+        video_streams = [s for s in streams if isinstance(s, dict) and s.get("codec_type") == "video"]
+        audio_streams = [s for s in streams if isinstance(s, dict) and s.get("codec_type") == "audio"]
+        if len(video_streams) != 1:
+            return False, "WEBM output must contain exactly one video stream"
+        if audio_streams:
+            return False, "WEBM output must not contain audio"
+
+        stream = video_streams[0]
+        if stream.get("codec_name") != "vp9":
+            return False, "WEBM output is not VP9"
+
+        try:
+            width = int(stream.get("width", 0))
+            height = int(stream.get("height", 0))
+        except (TypeError, ValueError):
+            return False, "WEBM output dimensions could not be verified"
+        if width != self._size or height != self._size:
+            return False, "WEBM output is not 512x512"
+
+        format_info = payload.get("format")
+        if not isinstance(format_info, dict):
+            return False, "WEBM output format could not be verified"
+        format_name = str(format_info.get("format_name", ""))
+        if "webm" not in format_name:
+            return False, "WEBM output container could not be verified"
+
+        durations = [
+            value
+            for value in (
+                self._duration_seconds(stream.get("duration")),
+                self._duration_seconds(format_info.get("duration")),
+            )
+            if value is not None
+        ]
+        if not durations:
+            return False, "WEBM output duration could not be verified"
+        if max(durations) > self._video_duration + 0.05:
+            return False, "WEBM output is longer than Telegram video sticker limits"
+
+        fps = self._fps(stream.get("avg_frame_rate")) or self._fps(stream.get("r_frame_rate"))
+        if fps is None:
+            return False, "WEBM output frame rate could not be verified"
+        if fps > self._video_fps + 0.01:
+            return False, "WEBM output frame rate is too high"
 
         return True, ""
+
+    @staticmethod
+    def _duration_seconds(value: object) -> float | None:
+        if value in (None, "N/A"):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _fps(value: object) -> float | None:
+        if not isinstance(value, str) or value in ("", "0/0", "N/A"):
+            return None
+        if "/" in value:
+            num_raw, den_raw = value.split("/", 1)
+            try:
+                num = float(num_raw)
+                den = float(den_raw)
+            except ValueError:
+                return None
+            if den == 0:
+                return None
+            return num / den
+        try:
+            return float(value)
+        except ValueError:
+            return None
 
     @staticmethod
     def _write_temp(data: bytes, suffix: str) -> str:
@@ -239,10 +373,15 @@ class StickerConverter:
 
     @staticmethod
     def _run_ffmpeg(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[bytes]:
-        result = subprocess.run(["ffmpeg", "-y", *args], capture_output=True, timeout=timeout, check=False)
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
         if result.returncode != 0:
             stderr = result.stderr.decode(errors="replace").strip()
-            raise OSError(stderr or "ffmpeg failed")
+            raise MediaToolError("FFmpeg failed to process this media", stderr=stderr)
         return result
 
     @staticmethod
